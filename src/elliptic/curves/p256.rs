@@ -4,11 +4,8 @@ use super::traits::{ECPoint, ECScalar};
 use crate::arithmetic::traits::*;
 use crate::BigInt;
 use crate::ErrorKey;
-use generic_array::typenum::U32;
-use generic_array::GenericArray;
-use p256::ecdsa::VerifyKey;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
+use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar, FieldBytes};
 use rand::{thread_rng, Rng};
 use serde::de;
 use serde::de::Visitor;
@@ -17,10 +14,12 @@ use serde::{Deserialize, Deserializer};
 use std::ops::{Add, Mul, Sub};
 use std::sync::atomic;
 use std::{fmt, ptr};
+use p256::elliptic_curve::{Field, PrimeField};
+use p256::elliptic_curve::group::prime::PrimeCurveAffine;
 use zeroize::Zeroize;
 
 pub type SK = Scalar;
-pub type PK = VerifyKey;
+pub type PK = AffinePoint;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Secp256r1Scalar {
@@ -31,7 +30,7 @@ pub struct Secp256r1Scalar {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Secp256r1Point {
     purpose: &'static str,
-    ge: PK,
+    pub ge: PK,
 }
 pub type GE = Secp256r1Point;
 pub type FE = Secp256r1Scalar;
@@ -60,12 +59,17 @@ impl ECScalar for Secp256r1Scalar {
     type SecretKey = SK;
 
     fn new_random() -> Secp256r1Scalar {
+        let mut bytes = FieldBytes::default();
         let mut arr = [0u8; 32];
-        thread_rng().fill(&mut arr[..]);
-        let gen_arr: GenericArray<u8, U32> = *GenericArray::from_slice(&arr);
-        Secp256r1Scalar {
-            purpose: "random",
-            fe: Scalar::from_bytes_reduced(&gen_arr),
+        loop {
+            thread_rng().fill(&mut arr);
+            bytes.copy_from_slice(&arr);
+            if let Some(scalar) = Scalar::from_repr(bytes.clone()).into() {
+                return Secp256r1Scalar {
+                    purpose: "random",
+                    fe: scalar,
+                }
+            }
         }
     }
 
@@ -76,6 +80,10 @@ impl ECScalar for Secp256r1Scalar {
             purpose: "zero",
             fe: zero,
         }
+    }
+
+    fn is_zero(&self) -> bool {
+        bool::from(self.fe.is_zero())
     }
 
     fn get_element(&self) -> SK {
@@ -97,11 +105,11 @@ impl ECScalar for Secp256r1Scalar {
             template.extend_from_slice(&v);
             v = template;
         }
-        let arr: GenericArray<u8, U32> = *GenericArray::from_slice(&v);
+        let bytes = FieldBytes::from_slice(&v);
 
         Secp256r1Scalar {
             purpose: "from_big_int",
-            fe: Scalar::from_bytes_reduced(&arr),
+            fe: Scalar::from_repr(bytes.clone()).unwrap(),
         }
     }
 
@@ -241,6 +249,17 @@ impl ECPoint for Secp256r1Point {
     type PublicKey = PK;
     type Scalar = Secp256r1Scalar;
 
+    fn zero() -> Secp256r1Point {
+        Secp256r1Point {
+            purpose: "zero",
+            ge: AffinePoint::identity(),
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        bool::from(self.ge.is_identity())
+    }
+
     fn base_point2() -> Secp256r1Point {
         let mut v = vec![4_u8];
         v.extend(BASE_POINT2_X.as_ref());
@@ -251,8 +270,7 @@ impl ECPoint for Secp256r1Point {
     fn generator() -> Secp256r1Point {
         Secp256r1Point {
             purpose: "base_fe",
-            ge: VerifyKey::from_encoded_point(&AffinePoint::generator().to_encoded_point(true))
-                .unwrap(),
+            ge: AffinePoint::generator(),
         }
     }
 
@@ -265,74 +283,49 @@ impl ECPoint for Secp256r1Point {
     }
 
     fn x_coor(&self) -> Option<BigInt> {
-        Some(BigInt::from_bytes(
-            EncodedPoint::from(&self.ge).x().as_slice(),
-        ))
+        let encoded = self.ge.to_encoded_point(false);
+        Some(BigInt::from_bytes(encoded.x()?.as_slice()))
     }
 
     fn y_coor(&self) -> Option<BigInt> {
-        // need this back and forth conversion to get an uncompressed point
-        let tmp = AffinePoint::from_encoded_point(&EncodedPoint::from(&self.ge)).unwrap();
-        Some(BigInt::from_bytes(
-            tmp.to_encoded_point(false).y().unwrap().as_slice(),
-        ))
+        let encoded = self.ge.to_encoded_point(false);
+        Some(BigInt::from_bytes(encoded.y()?.as_slice()))
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Secp256r1Point, ErrorKey> {
-        let result = PK::new(&bytes);
-        let test = result.map(|pk| Secp256r1Point {
+        let encoded = EncodedPoint::from_bytes(bytes).map_err(|_| ErrorKey::InvalidPublicKey)?;
+        let affine_point = AffinePoint::from_encoded_point(&encoded);
+        if bool::from(affine_point.is_none()) {
+            return Err(ErrorKey::InvalidPublicKey);
+        }
+        Ok(Secp256r1Point {
             purpose: "random",
-            ge: pk,
-        });
-        test.map_err(|_err| ErrorKey::InvalidPublicKey)
+            ge: affine_point.unwrap(),
+        })
     }
 
     fn pk_to_key_slice(&self) -> Vec<u8> {
-        let tmp = AffinePoint::from_encoded_point(&EncodedPoint::from(&self.ge)).unwrap();
-        tmp.to_encoded_point(false).as_ref().to_vec()
+        self.ge.to_encoded_point(false).as_ref().to_vec()
     }
 
     fn scalar_mul(&self, fe: &SK) -> Secp256r1Point {
-        let point = ProjectivePoint::from(
-            AffinePoint::from_encoded_point(&EncodedPoint::from(&self.ge)).unwrap(),
-        );
-        let scalar = Scalar::from_bytes_reduced(&fe.to_bytes());
         Secp256r1Point {
             purpose: "mul",
-            ge: VerifyKey::from_encoded_point(&(point * scalar).to_affine().to_encoded_point(true))
-                .unwrap(),
+            ge: (ProjectivePoint::from(&self.ge) * fe).to_affine(),
         }
     }
 
     fn add_point(&self, other: &PK) -> Secp256r1Point {
-        let point1 = ProjectivePoint::from(
-            AffinePoint::from_encoded_point(&EncodedPoint::from(&self.ge)).unwrap(),
-        );
-        let point2 = ProjectivePoint::from(
-            AffinePoint::from_encoded_point(&EncodedPoint::from(other)).unwrap(),
-        );
         Secp256r1Point {
             purpose: "mul",
-            ge: VerifyKey::from_encoded_point(
-                &(point1 + point2).to_affine().to_encoded_point(true),
-            )
-            .unwrap(),
+            ge: (ProjectivePoint::from(&self.ge) + other).to_affine(),
         }
     }
 
     fn sub_point(&self, other: &PK) -> Secp256r1Point {
-        let point1 = ProjectivePoint::from(
-            AffinePoint::from_encoded_point(&EncodedPoint::from(&self.ge)).unwrap(),
-        );
-        let point2 = ProjectivePoint::from(
-            AffinePoint::from_encoded_point(&EncodedPoint::from(other)).unwrap(),
-        );
         Secp256r1Point {
             purpose: "sub",
-            ge: VerifyKey::from_encoded_point(
-                &(point1 - point2).to_affine().to_encoded_point(true),
-            )
-            .unwrap(),
+            ge: (ProjectivePoint::from(self.ge) - other).to_affine(),
         }
     }
 
@@ -355,12 +348,10 @@ impl ECPoint for Secp256r1Point {
             vec_y = y_buffer
         }
 
-        let x_arr: GenericArray<u8, U32> = *GenericArray::from_slice(&vec_x);
-        let y_arr: GenericArray<u8, U32> = *GenericArray::from_slice(&vec_y);
         Secp256r1Point {
             purpose: "base_fe",
-            ge: VerifyKey::from_encoded_point(&EncodedPoint::from_affine_coordinates(
-                &x_arr, &y_arr, false,
+            ge: PK::from_encoded_point(&EncodedPoint::from_affine_coordinates(
+                FieldBytes::from_slice(&vec_x), FieldBytes::from_slice(&vec_y), false,
             ))
             .unwrap(),
         }
@@ -504,6 +495,21 @@ mod tests {
             purpose: "random_point",
             ge: pk.get_element(),
         }
+    }
+
+    #[test]
+    fn test_is_zero() {
+        let f_l = Secp256r1Scalar::new_random();
+        let f_r = f_l.clone();
+        let f_s = f_l.sub(&f_r.get_element());
+        assert!(!f_l.is_zero());
+        assert!(f_s.is_zero());
+
+        let p_l = Secp256r1Point::generator();
+        let p_r = p_l.clone();
+        let p_s = p_l.sub_point(&p_r.get_element());
+        println!("p_l: {:?}\np_s: {:?}", p_l, p_s);
+        // assert!(p_s.is_zero());
     }
 
     #[test]

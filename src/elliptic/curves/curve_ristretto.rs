@@ -16,7 +16,7 @@ use curve25519_dalek::constants::BASEPOINT_ORDER;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED;
 use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar;
-use rand::thread_rng;
+use curve25519_dalek::traits::{Identity, IsIdentity};
 use serde::de::{self, Error, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::ser::{Serialize, Serializer};
@@ -67,9 +67,16 @@ impl ECScalar for RistrettoScalar {
     type SecretKey = SK;
 
     fn new_random() -> RistrettoScalar {
+        use rand::RngCore;
+        #[cfg(feature = "wasm")]
+        let mut rng = rand::rngs::OsRng;
+        #[cfg(not(feature = "wasm"))]
+        let mut rng = rand::thread_rng();
+        let mut ret = [0u8; 32];
+        rng.fill_bytes(&mut ret);
         RistrettoScalar {
             purpose: "random",
-            fe: SK::random(&mut thread_rng()),
+            fe: SK::from_bytes_mod_order(ret),
         }
     }
 
@@ -79,6 +86,10 @@ impl ECScalar for RistrettoScalar {
             purpose: "zero",
             fe: q_fe.get_element(),
         }
+    }
+
+    fn is_zero(&self) -> bool {
+        self == &Self::zero()
     }
 
     fn get_element(&self) -> SK {
@@ -255,6 +266,17 @@ impl ECPoint for RistrettoCurvPoint {
     type SecretKey = SK;
     type PublicKey = PK;
     type Scalar = RistrettoScalar;
+
+    fn zero() -> Self {
+        RistrettoCurvPoint {
+            purpose: "zero",
+            ge: PK::identity(),
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.ge.is_identity()
+    }
 
     fn base_point2() -> RistrettoCurvPoint {
         let g: GE = ECPoint::generator();
@@ -497,6 +519,20 @@ mod tests {
 
     type GE = RistrettoCurvPoint;
     type FE = RistrettoScalar;
+
+    #[test]
+    fn test_is_zero() {
+        let f_l = RistrettoScalar::new_random();
+        let f_r = f_l.clone();
+        let f_s = f_l.sub(&f_r.get_element());
+        assert!(!f_l.is_zero());
+        assert!(f_s.is_zero());
+
+        let p_l = RistrettoCurvPoint::generator();
+        let p_r = p_l.clone();
+        let p_s = p_l.sub_point(&p_r.get_element());
+        assert!(p_s.is_zero());
+    }
 
     #[test]
     fn test_serdes_pk() {
